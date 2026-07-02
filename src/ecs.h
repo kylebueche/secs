@@ -5,12 +5,18 @@
 #ifndef SECS_ECS_H_
 #define SECS_ECS_H_
 
+#include <cassert>
 #include <cstdint>
 #include <vector>
 #include <type_traits>
 #include <memory>
 
 using EntityID = std::size_t;
+
+struct Entity {
+    EntityID id;
+    uint64_t generation;
+};
 
 // A simple Sparse Set.
 template <typename T>
@@ -91,29 +97,48 @@ struct SparseSet
         reserve(size() + 1);
         SparseID sparseID = dense[size()];
         values.push_back(value);
+        return sparseID;
     }
 
-    bool insertAt(SparseID sparseID, T value) {
+    // TODO: Fix functionality.
+    // Current issue:
+    // swapDense() only works if both DenseIDs are less than size()
+    // Inserting at an unused sparse index is guaranteed to yield
+    // a dense index greater than or equal to size.
+    // Desired behavior:
+    // values.push_back(),
+    // followed by making the specific sparse ID point to size() - 1
+    // This can be achieved by locating the Dense ID at the tail,
+    // and taking the desired Sparse ID, finding their counterparts,
+    // and swapping the Sparse & Dense IDs respectively.
+    // this can be a new function called swapSparse(i, j).
+    // This is only valid when SparseIDs i and j have no value data.
+    // If allocating an unused sparse ID, both it and the tail at size()
+    // are guaranteed to have no value data
+    // Note: Large sparseIDs can cause a huge resize
+    bool insert(SparseID sparseID, T value) {
         if (isValidSparseID(sparseID)) return false;
         reserve(sparseID + 1);
+        push_back(value);
 
-        DenseID currentDensePos = sparse[sparseID];
-        swapDense(numValues, currentDensePos);
-        std::swap(dense[numValues], dense[currentDensePos]);
-        sparse[dense[numValues]] = numValues;
-        values[numValues] = std::move(value);
-        numValues++;
+        swapSparse(dense[size()], sparseID);
         return true;
     }
+
 
     void remove(SparseID sparseID) {
         if (!isValidSparseID(sparseID)) return;
 
         DenseID denseID = sparse[sparseID];
-        DenseID tailDenseID = numValues - 1;
+        DenseID tailDenseID = size() - 1;
 
         swapDense(denseID, tailDenseID); // Swap...
         values.pop_back(); // & pop!
+    }
+
+    T pop_back() {
+        assert(size() > 0);
+        return values.pop_back();
     }
 
 private:
@@ -121,6 +146,10 @@ private:
         std::swap(sparse[dense[i]], sparse[dense[j]]);
         std::swap(dense[i], dense[j]);
         std::swap(values[i], values[j]);
+    }
+    void swapSparse(SparseID i, SparseID j) {
+        std::swap(dense[sparse[i]], dense[sparse[j]]);
+        std::swap(sparse[i], sparse[j]);
     }
 };
 
@@ -131,12 +160,16 @@ template <class... ComponentTypes>
 class EcsRegistry
 {
 public:
-    struct ECS_BUILTIN_EntityAlive {};
+    struct ECS_GENERATION
+    {
+        uint64_t generation;
+    };
 
-    std::tuple<Component<ECS_BUILTIN_EntityAlive>, Component<ComponentTypes>...> componentList;
+    std::tuple<Component<ECS_GENERATION>, Component<ComponentTypes>...> componentList;
+    std::vector<EntityID> reusePool;
 
     template <typename T>
-    auto registerComponent() {
+    auto addComponent() {
         static_assert(!(std::is_same_v<ComponentTypes, T> || ...));
         return EcsRegistry<ComponentTypes..., std::decay_t<T>>(
             std::move(std::tuple_cat(std::move(componentList), std::tuple<Component<T>>())));
@@ -147,35 +180,54 @@ public:
         return std::get<T>(componentList);
     }
 
-    EntityID newEntity() {
-        getComponent<ECS_BUILTIN_EntityAlive>().insert({});
+    bool isValidEntity(Entity entity) {
+        return entity.generation == getComponent<ECS_GENERATION>()[entity.id].generation;
     }
 
-    void killEntity(EntityID entity) {
-        getComponent<ECS_BUILTIN_EntityAlive>().remove(entity);
+    Entity spawnEntity() {
+        Component<ECS_GENERATION>& generations = getComponent<ECS_GENERATION>();
+        if (reusePool.empty()) {
+            EntityID entityID = reusePool.back();
+            reusePool.pop_back();
+            return Entity(entityID, generations[entityID].generation);
+        }
+        EntityID entityID = generations.push_back(ECS_GENERATION{.generation=0});
+        return Entity(entityID, 0);
+    }
+
+    bool killEntity(Entity entity) {
+        if (!isValidEntity(entity)) return false;
+        getComponent<ECS_GENERATION>()[entity.id].generation += 1;
+        reusePool.push_back(entity.id);
         (getComponent<ComponentTypes>().remove(entity), ...);
+        return true;
+    }
+
+    template <typename ComponentType>
+    void addComponentToEntity(Entity entity, ComponentType value) {
+        getComponent<ComponentType>().insert(entity.id, value);
     }
 
     // Aligns an archetype of components in memory so that
     // the dense data is contiguous in an SoA format.
     // Returns the size of the archetype.
     template <typename... Components>
-    std::size_t align() {
+    std::size_t alignArchetype() {
         std::size_t minSize = min(getComponent<Components>().size() ...);
         std::size_t archetypeSize = 0;
 
         auto iterateSmallestList = [&](auto& component) {
-            if (component.size() == minSize) {
-                for (std::size_t i = 0; i < minSize; i++) {
-                    EntityID entityID = component.dense[i];
-                    if ((getComponent<Components>().isRegistered(entityID) && ...)) {
-                        (getComponent<Components>().swapDense(i, archetypeSize), ...);
-                        archetypeSize++;
-                    }
+            if (component.size() != minSize)
+                return false;
+
+            for (std::size_t i = 0; i < minSize; i++) {
+                EntityID entityID = component.dense[i];
+                if ((getComponent<Components>().isRegistered(entityID) && ...)) {
+                    (getComponent<Components>().swapDense(i, archetypeSize), ...);
+                    archetypeSize++;
                 }
-                return true;
             }
-            return false;
+            return true;
         };
 
         (iterateSmallestList(getComponent<Components>()) || ...);
@@ -183,6 +235,27 @@ public:
     }
 
 
+};
+
+// Experimental
+template <typename... types>
+struct VectorSoA
+{
+    std::tuple<std::vector<types>...> vectors;
+    std::size_t size() const { return std::get<0>(vectors).size(); }
+    std::size_t capacity() const { return std::get<0>(vectors).capacity(); }
+    auto data(std::size_t index) { return std::get<index>(vectors); }
+    void push_back(types... vals) {
+        auto tup = std::forward_as_tuple(vals...);
+        for (int i = 0; i < size(); i++) {
+            std::get<i>(vectors).push_back(std::get<i>(tup));
+        }
+    }
+    void pop_back() {
+        for (int i = 0; i < size(); i++) {
+            std::get<i>(vectors).pop_back(std::get<i>(vectors));
+        }
+    }
 };
 
 #endif //SECS_ECS_H_
